@@ -1,0 +1,15 @@
+# Secrets and local config
+.env
+
+# SQLite databases
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Air / build artifacts
+tmp/
+build-errors.log
+
+# OS
+.DS_Store
