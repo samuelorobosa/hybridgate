@@ -1,17 +1,17 @@
 # Hybridgate
 
-Hybridgate is a Go API that provides **authentication and role-based access control (RBAC)** for applications that need short-lived access tokens, refreshable sessions, and the ability to **revoke access quickly** without waiting for a JWT to expire.
+Hybridgate is a Go API that handles **authentication and role-based access control (RBAC)** for applications that need short-lived access tokens, refreshable sessions, and the ability to **revoke access instantly** — without sitting around waiting for a JWT to expire naturally.
 
-The name reflects the idea of a **gate** between clients and protected resources: verify identity, attach permissions, issue credentials, and (planned) enforce revocation via a Redis-backed JWT blacklist keyed by `jti` (JWT ID).
+The name reflects the core idea: a **gate** between clients and protected resources. Verify identity, attach permissions, issue credentials, and enforce revocation via a Redis-backed JWT blacklist keyed by `jti` (JWT ID).
 
-## What we are building
+## The problem it solves
 
 Most apps need the same core auth story:
 
-1. **Login** — verify email/password, load the user’s effective permissions from roles.
-2. **Access** — send a short-lived **access token** (JWT) on each API call; embed permissions so services can authorize without hitting the DB every time.
-3. **Refresh** — use a longer-lived **refresh token** to mint new access tokens when permissions may have changed.
-4. **Revoke** — when an admin disables a user or changes roles, **invalidate active sessions immediately** by blacklisting the access token’s `jti` in Redis (TTL aligned with access token lifetime).
+1. **Login** — verify email/password, load the user's effective permissions from their roles.
+2. **Access** — attach a short-lived **access token** (JWT) to each API call; embed permissions so downstream services can authorize without hitting the DB every time.
+3. **Refresh** — use a longer-lived **refresh token** to mint new access tokens, picking up any permission changes in the process.
+4. **Revoke** — when an admin disables a user or changes roles, **invalidate active sessions immediately** by blacklisting the access token's `jti` in Redis (TTL aligned with the access token lifetime).
 
 Hybridgate implements that model with:
 
@@ -32,7 +32,7 @@ Permissions are fine-grained **slugs** (e.g. `file:read`, `file:write`, `admin:r
 users ── user_roles ── roles ── role_permissions ── permissions
 ```
 
-Access tokens carry permissions at issue time. **Refresh** re-queries the database so role changes take effect on the next access token.
+Access tokens carry permissions at issue time. **Refresh** re-queries the database so role changes take effect on the next access token — no need to force a full re-login.
 
 ### Token strategy
 
@@ -41,7 +41,7 @@ Access tokens carry permissions at issue time. **Refresh** re-queries the databa
 | Access | 15 minutes | JSON response body | `sub` (user CUID), `email`, `permissions`, `jti`, `typ: access` |
 | Refresh | 1 hour | `HttpOnly` cookie (`refresh_token`) | `sub`, `jti`, `typ: refresh`; row stored in `refresh_tokens` |
 
-The refresh token is **not** returned in the login JSON body; it is set as a cookie scoped to `/api/v1/auth/refresh` so browsers can call a future refresh endpoint without exposing the token to JavaScript.
+The refresh token is **not** included in the login JSON body — it's set as a cookie scoped to `/api/v1/auth/refresh`, so browsers can silently refresh without ever exposing the token to JavaScript.
 
 ## Current status
 
@@ -136,7 +136,7 @@ REDIS_URL=redis://localhost:6379/0
 JWT_SECRET=your-long-random-secret
 ```
 
-`JWT_SECRET` must be set; the server uses it to sign and verify JWTs.
+`JWT_SECRET` must be set; the server uses it to sign and verify all JWTs.
 
 ### 2. Seed the database
 
@@ -251,9 +251,9 @@ Full request/response schemas: [`openapi.yaml`](openapi.yaml).
 
 - Never commit `.env` or `*.db` files (see `.gitignore`).
 - Use a strong `JWT_SECRET` in production and run HTTPS so cookies can use `Secure`.
-- Access tokens embed permissions at issue time; call **refresh** after role changes to pick up new permissions.
+- Access tokens embed permissions at issue time; call **refresh** after role changes to pick up updated permissions.
 - Admin **revoke** strips roles and blocks the user in Redis for the access-token TTL (15 min).
-- `jti` blacklist on logout blocks a specific access token immediately.
+- `jti` blacklist on logout blocks a specific access token immediately, no waiting for expiry.
 
 ## License
 
