@@ -19,7 +19,7 @@ Hybridgate implements that model with:
 |--------|------------|------|
 | API | [Gin](https://github.com/gin-gonic/gin) | HTTP routes and JSON responses |
 | Identity store | SQLite | Users, roles, permissions, join tables, refresh token records |
-| Session cache | Redis | (Planned) `jti` blacklist for instant revocation |
+| Session cache | Redis | `jti` blacklist + per-user revocation flags |
 | Passwords | [argon2id](https://github.com/alexedwards/argon2id) | Secure password hashing |
 | Tokens | [jwt/v5](https://github.com/golang-jwt/jwt) + [CUID](https://github.com/lucsky/cuid) | Signed JWTs with unique `jti` per token |
 | IDs | CUID strings | Primary keys across users, roles, permissions, sessions |
@@ -32,7 +32,7 @@ Permissions are fine-grained **slugs** (e.g. `file:read`, `file:write`, `admin:r
 users ── user_roles ── roles ── role_permissions ── permissions
 ```
 
-Access tokens carry the resolved permission list at login time. Refresh (planned) will re-query the database so permission changes take effect on the next access token.
+Access tokens carry permissions at issue time. **Refresh** re-queries the database so role changes take effect on the next access token.
 
 ### Token strategy
 
@@ -47,18 +47,14 @@ The refresh token is **not** returned in the login JSON body; it is set as a coo
 
 **Implemented**
 
-- SQLite schema and migrations-on-startup (`CREATE TABLE IF NOT EXISTS`)
-- Seed script for roles, permissions, test users, and role mappings
-- `POST /api/v1/auth/login` — Argon2id verify, permission load, JWT issue, refresh cookie
-- Redis client initialization (ready for blacklist middleware)
+- SQLite RBAC schema + seed script
+- **Phase 1 — Login:** `POST /api/v1/auth/login` (Argon2id, JWT + refresh cookie)
+- **Phase 2 — Revocation:** `POST /api/v1/auth/revoke` (admin only — strips roles, revokes refresh tokens, Redis user block)
+- **Phase 3 — Middleware:** JWT verify, Redis `jti` blacklist, permission checks, `GET /api/v1/files`
+- **Phase 4 — Refresh:** `POST /api/v1/auth/refresh` (cookie-based, reloads permissions from DB)
+- **Logout:** `POST /api/v1/auth/logout` (blacklist access `jti`, revoke refresh)
+- OpenAPI 3 spec (`openapi.yaml`) for Bruno, Postman, Insomnia
 - Dev workflow with [Air](https://github.com/air-verse/air) hot reload
-
-**Planned** (see sequence diagram below)
-
-- Auth middleware (JWT verify + Redis `jti` check)
-- `POST /api/v1/auth/refresh`
-- Admin revocation (DB role change + Redis blacklist)
-- Protected resource routes
 
 ## Architecture
 
@@ -77,12 +73,12 @@ sequenceDiagram
     Server->>Server: Sign JWTs with unique jti
     Server-->>Client: Access token (JSON) + refresh token (cookie)
 
-    Note over Client, Server: Phase 2: Instant revocation (planned)
+    Note over Client, Server: Phase 2: Instant revocation (implemented)
     Admin->>Server: Revoke user access
     Server->>Database: Update roles / user state
     Server->>RedisBlacklist: Add jti to blacklist (TTL ≈ access token life)
 
-    Note over Client, Server: Phase 3: Resource access (planned)
+    Note over Client, Server: Phase 3: Resource access (implemented)
     Client->>Middleware: Request + Bearer access token
     Middleware->>Middleware: Verify signature and expiry
     Middleware->>RedisBlacklist: Is jti blacklisted?
@@ -95,7 +91,7 @@ sequenceDiagram
         Server-->>Client: 200 OK
     end
 
-    Note over Client, Server: Phase 4: Refresh (planned)
+    Note over Client, Server: Phase 4: Refresh (implemented)
     Client->>Server: POST /refresh (cookie)
     Server->>Database: Validate refresh row + load current permissions
     Server->>Server: Issue new access JWT
@@ -113,6 +109,7 @@ hybridgate/
 │       ├── database/     # SQLite connection and schema
 │       └── redis/        # Redis client
 ├── seed.go               # RBAC + user seed script
+├── openapi.yaml          # OpenAPI 3 spec (import into Bruno, Postman, Insomnia)
 ├── .air.toml             # Live reload config
 ├── .env.example          # Environment template (commit this)
 └── hybridgate.db         # Local SQLite file (gitignored)
@@ -122,7 +119,7 @@ hybridgate/
 
 - Go 1.25+
 - SQLite3 (CGO — Xcode CLI tools on macOS)
-- Redis (for blacklist once middleware lands; required at startup today)
+- Redis (required — `jti` blacklist and user revocation flags)
 
 ## Getting started
 
@@ -161,21 +158,27 @@ If you change the schema, delete the local DB and re-seed:
 rm -f hybridgate.db && go run seed.go
 ```
 
-### 3. Run the API
+### 3. Start Redis (if needed)
 
-With Air (recommended):
+```bash
+docker run -d --name hybridgate-redis -p 6379:6379 redis:7-alpine
+```
+
+### 4. Run the API
+
+With Air (recommended — loads `.env` automatically):
 
 ```bash
 air
 ```
 
-Or directly:
+Or directly (load env vars first):
 
 ```bash
-go run ./cmd/api
+export $(grep -v '^#' .env | xargs) && go run ./cmd/api
 ```
 
-Server listens on **`:8080`**. Air loads variables from `.env` via `env_files` in `.air.toml`.
+Server listens on **`:8080`**.
 
 ## Seed data
 
@@ -187,66 +190,70 @@ All seeded users share the password **`password123`**.
 | manager@test.com | Manager | `file:read`, `file:write` |
 | guest@test.com | Viewer | `file:read` |
 
-## API
+## API documentation
 
-### Health check
+The full contract lives in **[`openapi.yaml`](openapi.yaml)** (OpenAPI 3.0).
 
-```http
-GET /api/v1/auth/ping
-```
+### Import into an API client
 
-### Login
+| Client | Steps |
+|--------|--------|
+| [Bruno](https://www.usebruno.com/) | Open Collection → Import → OpenAPI → select `openapi.yaml` |
+| Postman | Import → OpenAPI 3 → select `openapi.yaml` |
+| Insomnia | Application → Import → From File → `openapi.yaml` |
 
-```http
-POST /api/v1/auth/login
-Content-Type: application/json
+Set the server URL to `http://localhost:8080`, then run **Ping** and **Login**.
 
-{
-  "email": "admin@test.com",
-  "password": "password123"
-}
-```
+### Endpoints
 
-**Success (200)**
+| Method | Path | Auth | Permission | Description |
+|--------|------|------|------------|-------------|
+| `GET` | `/api/v1/auth/ping` | — | — | Health check |
+| `POST` | `/api/v1/auth/login` | — | — | Login; access token in JSON, refresh in cookie |
+| `POST` | `/api/v1/auth/refresh` | Cookie | — | New access token (fresh permissions) |
+| `POST` | `/api/v1/auth/logout` | Bearer | — | Blacklist `jti`, clear refresh cookie |
+| `POST` | `/api/v1/auth/revoke` | Bearer | `admin:revoke` | Revoke a user's roles and sessions |
+| `GET` | `/api/v1/files` | Bearer | `file:read` | Example protected resource |
 
-```json
-{
-  "ok": true,
-  "message": "login successful",
-  "data": {
-    "access_token": "<jwt>",
-    "expires_in": 900,
-    "permissions": ["admin:revoke", "file:read", "file:write"]
-  }
-}
-```
-
-Also sets an `HttpOnly` cookie:
-
-- Name: `refresh_token`
-- Path: `/api/v1/auth/refresh`
-- Max-Age: 1 hour
-
-**Errors**
-
-- `400` — validation failed
-- `401` — invalid credentials
-- `500` — server error (e.g. missing `JWT_SECRET`, database/Redis failure)
-
-### Example
+### Quick test (curl)
 
 ```bash
-curl -s -X POST http://localhost:8080/api/v1/auth/login \
+BASE=http://localhost:8080
+
+# Ping
+curl -s $BASE/api/v1/auth/ping | jq
+
+# Login (admin) — save token
+TOKEN=$(curl -s -c /tmp/hg-cookies.txt -X POST $BASE/api/v1/auth/login \
   -H 'Content-Type: application/json' \
-  -d '{"email":"admin@test.com","password":"password123"}' | jq
+  -d '{"email":"admin@test.com","password":"password123"}' | jq -r '.data.access_token')
+
+# Protected files (requires file:read)
+curl -s $BASE/api/v1/files -H "Authorization: Bearer $TOKEN" | jq
+
+# Refresh (uses cookie from login)
+curl -s -b /tmp/hg-cookies.txt -c /tmp/hg-cookies.txt -X POST $BASE/api/v1/auth/refresh | jq
+
+# Revoke manager (admin only)
+curl -s -X POST $BASE/api/v1/auth/revoke \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"manager@test.com"}' | jq
+
+# Logout
+curl -s -b /tmp/hg-cookies.txt -X POST $BASE/api/v1/auth/logout \
+  -H "Authorization: Bearer $TOKEN" | jq
 ```
+
+Full request/response schemas: [`openapi.yaml`](openapi.yaml).
 
 ## Security notes
 
 - Never commit `.env` or `*.db` files (see `.gitignore`).
 - Use a strong `JWT_SECRET` in production and run HTTPS so cookies can use `Secure`.
-- Access tokens embed permissions at issue time; refresh/re-auth is required after role changes until refresh is implemented.
-- `jti` in each JWT supports O(1) revocation checks in Redis once middleware is added.
+- Access tokens embed permissions at issue time; call **refresh** after role changes to pick up new permissions.
+- Admin **revoke** strips roles and blocks the user in Redis for the access-token TTL (15 min).
+- `jti` blacklist on logout blocks a specific access token immediately.
 
 ## License
 

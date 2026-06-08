@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
@@ -9,16 +10,17 @@ import (
 	"github.com/lucsky/cuid"
 )
 
-// ErrInvalidCredentials is returned when email/password do not match a user.
-var ErrInvalidCredentials = errors.New("invalid credentials")
+var (
+	ErrInvalidCredentials = errors.New("invalid credentials")
+	ErrInvalidToken       = errors.New("invalid token")
+	ErrUserNotFound       = errors.New("user not found")
+)
 
-// LoginInput is transport-agnostic credentials passed from the HTTP layer (or tests).
 type LoginInput struct {
 	Email    string
 	Password string
 }
 
-// LoginResult holds issued tokens and authorization metadata for the client.
 type LoginResult struct {
 	AccessToken  string   `json:"access_token"`
 	RefreshToken string   `json:"refresh_token"`
@@ -26,7 +28,10 @@ type LoginResult struct {
 	Permissions  []string `json:"permissions"`
 }
 
-// LoginUser authenticates the user, loads permissions, and issues access + refresh JWTs.
+type RevokeInput struct {
+	Email string
+}
+
 func LoginUser(in LoginInput) (*LoginResult, error) {
 	user, err := getUserByEmail(in.Email)
 	if err != nil {
@@ -44,7 +49,95 @@ func LoginUser(in LoginInput) (*LoginResult, error) {
 		return nil, ErrInvalidCredentials
 	}
 
-	permissions, err := getUserPermissions(user.CUID)
+	return issueSession(user.CUID, user.Email)
+}
+
+func RefreshSession(refreshToken string) (*LoginResult, error) {
+	parsed, err := ParseRefreshToken(refreshToken)
+	if err != nil {
+		return nil, ErrInvalidToken
+	}
+
+	reqCtx := context.Background()
+	revoked, err := IsUserRevoked(reqCtx, parsed.UserCUID)
+	if err != nil {
+		return nil, err
+	}
+	if revoked {
+		return nil, ErrInvalidToken
+	}
+
+	record, err := getRefreshTokenByJTI(parsed.JTI)
+	if err != nil {
+		return nil, err
+	}
+	if record == nil || record.Revoked {
+		return nil, ErrInvalidToken
+	}
+
+	expiresAt, err := time.Parse(time.RFC3339, record.ExpiresAt)
+	if err != nil {
+		return nil, fmt.Errorf("parse refresh expiry: %w", err)
+	}
+	if time.Now().After(expiresAt) {
+		return nil, ErrInvalidToken
+	}
+
+	user, err := getUserByCUID(parsed.UserCUID)
+	if err != nil {
+		return nil, err
+	}
+	if user == nil {
+		return nil, ErrInvalidToken
+	}
+
+	if err := revokeRefreshTokenByJTI(parsed.JTI); err != nil {
+		return nil, err
+	}
+
+	return issueSession(user.CUID, user.Email)
+}
+
+func RevokeUser(ctx context.Context, in RevokeInput) error {
+	user, err := getUserByEmail(in.Email)
+	if err != nil {
+		return err
+	}
+	if user == nil {
+		return ErrUserNotFound
+	}
+
+	if err := removeAllUserRoles(user.CUID); err != nil {
+		return err
+	}
+	if err := revokeAllRefreshTokensForUser(user.CUID); err != nil {
+		return err
+	}
+	if err := MarkUserRevoked(ctx, user.CUID, accessTokenTTL); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func LogoutUser(ctx context.Context, accessJTI, refreshToken string) error {
+	if accessJTI != "" {
+		if err := BlacklistJTI(ctx, accessJTI, accessTokenTTL); err != nil {
+			return err
+		}
+	}
+
+	if refreshToken != "" {
+		if parsed, err := ParseRefreshToken(refreshToken); err == nil {
+			_ = revokeRefreshTokenByJTI(parsed.JTI)
+		}
+	}
+
+	return nil
+}
+
+func issueSession(userCUID, email string) (*LoginResult, error) {
+	permissions, err := getUserPermissions(userCUID)
 	if err != nil {
 		return nil, err
 	}
@@ -52,18 +145,18 @@ func LoginUser(in LoginInput) (*LoginResult, error) {
 	accessJTI := cuid.New()
 	refreshJTI := cuid.New()
 
-	accessToken, err := signAccessToken(user.CUID, user.Email, accessJTI, permissions, accessTokenTTL)
+	accessToken, err := signAccessToken(userCUID, email, accessJTI, permissions, accessTokenTTL)
 	if err != nil {
 		return nil, err
 	}
 
-	refreshToken, err := signRefreshToken(user.CUID, refreshJTI, refreshTokenTTL)
+	refreshToken, err := signRefreshToken(userCUID, refreshJTI, refreshTokenTTL)
 	if err != nil {
 		return nil, err
 	}
 
 	expiresAt := time.Now().Add(refreshTokenTTL).UTC().Format(time.RFC3339)
-	if err := storeRefreshToken(cuid.New(), user.CUID, refreshJTI, expiresAt); err != nil {
+	if err := storeRefreshToken(cuid.New(), userCUID, refreshJTI, expiresAt); err != nil {
 		return nil, err
 	}
 

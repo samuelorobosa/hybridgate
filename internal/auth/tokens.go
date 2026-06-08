@@ -72,3 +72,61 @@ func signRefreshToken(userCUID, jti string, ttl time.Duration) (string, error) {
 
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(secret)
 }
+
+type ParsedToken struct {
+	TokenType   string
+	UserCUID    string
+	Email       string
+	Permissions []string
+	JTI         string
+	ExpiresAt   time.Time
+}
+
+func parseToken(tokenString string, expectedType string) (*ParsedToken, error) {
+	secret, err := jwtSecret()
+	if err != nil {
+		return nil, err
+	}
+
+	claims := &tokenClaims{}
+	token, err := jwt.ParseWithClaims(tokenString, claims, func(t *jwt.Token) (any, error) {
+		if t.Method != jwt.SigningMethodHS256 {
+			return nil, fmt.Errorf("unexpected signing method")
+		}
+		return secret, nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("parse token: %w", err)
+	}
+	if !token.Valid {
+		return nil, fmt.Errorf("invalid token")
+	}
+	if claims.TokenType != expectedType {
+		return nil, fmt.Errorf("unexpected token type %q", claims.TokenType)
+	}
+	if claims.Subject == "" || claims.ID == "" {
+		return nil, fmt.Errorf("token missing subject or jti")
+	}
+
+	expiresAt := time.Time{}
+	if claims.ExpiresAt != nil {
+		expiresAt = claims.ExpiresAt.Time
+	}
+
+	return &ParsedToken{
+		TokenType:   claims.TokenType,
+		UserCUID:    claims.Subject,
+		Email:       claims.Email,
+		Permissions: claims.Permissions,
+		JTI:         claims.ID,
+		ExpiresAt:   expiresAt,
+	}, nil
+}
+
+func ParseAccessToken(tokenString string) (*ParsedToken, error) {
+	return parseToken(tokenString, tokenTypeAccess)
+}
+
+func ParseRefreshToken(tokenString string) (*ParsedToken, error) {
+	return parseToken(tokenString, tokenTypeRefresh)
+}

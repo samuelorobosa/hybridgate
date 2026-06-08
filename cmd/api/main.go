@@ -16,17 +16,30 @@ func main() {
 
 	router := gin.Default()
 
+	authGroup := router.Group("/api/v1/auth")
 	{
-		v1 := router.Group("/api/v1/auth")
-
-		v1.GET("/ping", func(ctx *gin.Context) {
+		authGroup.GET("/ping", func(ctx *gin.Context) {
 			ctx.JSON(http.StatusOK, gin.H{
 				"ok":      true,
 				"message": "pong",
 			})
 		})
 
-		v1.POST("/login", auth.HandleLogin)
+		authGroup.POST("/login", auth.HandleLogin)
+		authGroup.POST("/refresh", auth.HandleRefresh)
+
+		protected := authGroup.Group("")
+		protected.Use(auth.RequireAuth())
+		{
+			protected.POST("/logout", auth.HandleLogout)
+			protected.POST("/revoke", auth.RequirePermission("admin:revoke"), auth.HandleRevoke)
+		}
+	}
+
+	api := router.Group("/api/v1")
+	api.Use(auth.RequireAuth())
+	{
+		api.GET("/files", auth.RequirePermission("file:read"), auth.HandleListFiles)
 	}
 
 	log.Println("listening on :8080")

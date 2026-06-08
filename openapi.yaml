@@ -1,0 +1,346 @@
+openapi: 3.0.3
+info:
+  title: Hybridgate API
+  description: |
+    Authentication and RBAC API for Hybridgate.
+
+    **Local setup**
+    1. `cp .env.example .env` and set `JWT_SECRET`
+    2. Start Redis (`docker run -d -p 6379:6379 redis:7-alpine`)
+    3. `go run seed.go`
+    4. `air` or `export $(grep -v '^#' .env | xargs) && go run ./cmd/api`
+
+    **Seed users** (password `password123`):
+    - admin@test.com — Admin (all permissions)
+    - manager@test.com — Manager (file:read, file:write)
+    - guest@test.com — Viewer (file:read)
+
+    **Flow:** Login → use `access_token` as Bearer → call protected routes.
+    Refresh uses the `refresh_token` HttpOnly cookie (set on login).
+  version: 0.2.0
+
+servers:
+  - url: http://localhost:8080
+    description: Local development
+
+tags:
+  - name: auth
+    description: Authentication and session management
+  - name: resources
+    description: Protected resources
+
+paths:
+  /api/v1/auth/ping:
+    get:
+      tags: [auth]
+      summary: Health check
+      operationId: ping
+      responses:
+        "200":
+          description: Service is up
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PingResponse"
+
+  /api/v1/auth/login:
+    post:
+      tags: [auth]
+      summary: Login
+      description: |
+        Returns access token in JSON. Sets HttpOnly `refresh_token` cookie
+        (path `/api/v1/auth/refresh`, max-age 3600s).
+      operationId: login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+            examples:
+              admin:
+                value:
+                  email: admin@test.com
+                  password: password123
+      responses:
+        "200":
+          description: Login successful
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LoginResponse"
+        "400":
+          description: Validation failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/auth/refresh:
+    post:
+      tags: [auth]
+      summary: Refresh access token
+      description: |
+        Reads `refresh_token` from cookie. Issues new access token with
+        **current** permissions from the database. Rotates refresh cookie.
+      operationId: refresh
+      parameters:
+        - in: cookie
+          name: refresh_token
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: New access token issued
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LoginResponse"
+        "401":
+          description: Missing or invalid refresh token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/auth/logout:
+    post:
+      tags: [auth]
+      summary: Logout
+      description: Blacklists current access token jti in Redis and revokes refresh token.
+      operationId: logout
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Logged out
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/auth/revoke:
+    post:
+      tags: [auth]
+      summary: Revoke user access (admin)
+      description: |
+        Requires `admin:revoke`. Removes all roles, revokes refresh tokens,
+        and marks user as revoked in Redis (blocks access tokens for 15 minutes).
+      operationId: revokeUser
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RevokeRequest"
+            example:
+              email: manager@test.com
+      responses:
+        "200":
+          description: User access revoked
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageResponse"
+        "400":
+          description: Validation failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Insufficient permissions
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: User not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/files:
+    get:
+      tags: [resources]
+      summary: List files
+      description: Requires `file:read` permission.
+      operationId: listFiles
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Files list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FilesResponse"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Insufficient permissions or access revoked
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Access token from login or refresh (`data.access_token`)
+
+  schemas:
+    PingResponse:
+      type: object
+      required: [ok, message]
+      properties:
+        ok:
+          type: boolean
+        message:
+          type: string
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          format: password
+
+    RevokeRequest:
+      type: object
+      required: [email]
+      properties:
+        email:
+          type: string
+          format: email
+
+    LoginData:
+      type: object
+      required: [access_token, expires_in, permissions]
+      properties:
+        access_token:
+          type: string
+        expires_in:
+          type: integer
+          format: int64
+        permissions:
+          type: array
+          items:
+            type: string
+
+    LoginResponse:
+      type: object
+      required: [ok, message, data]
+      properties:
+        ok:
+          type: boolean
+        message:
+          type: string
+        data:
+          $ref: "#/components/schemas/LoginData"
+
+    MessageResponse:
+      type: object
+      required: [ok, message]
+      properties:
+        ok:
+          type: boolean
+        message:
+          type: string
+
+    FilesResponse:
+      type: object
+      required: [ok, message, data]
+      properties:
+        ok:
+          type: boolean
+        message:
+          type: string
+        data:
+          type: object
+          properties:
+            files:
+              type: array
+              items:
+                type: object
+                properties:
+                  name:
+                    type: string
+                  permission:
+                    type: string
+            requested_by:
+              type: string
+
+    ErrorResponse:
+      type: object
+      required: [ok, message]
+      properties:
+        ok:
+          type: boolean
+        message:
+          type: string
