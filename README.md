@@ -1,6 +1,6 @@
 # Hybridgate
 
-Hybridgate is a Go API that handles **authentication and role-based access control (RBAC)** for applications that need short-lived access tokens, refreshable sessions, and the ability to **revoke access instantly** — without sitting around waiting for a JWT to expire naturally.
+Hybridgate is a Go API that handles **authentication and role-based access control (RBAC)** for applications that need short-lived access tokens, refreshable sessions, and the ability to **revoke access instantly**, without sitting around waiting for a JWT to expire naturally.
 
 The name reflects the core idea: a **gate** between clients and protected resources. Verify identity, attach permissions, issue credentials, and enforce revocation via a Redis-backed JWT blacklist keyed by `jti` (JWT ID).
 
